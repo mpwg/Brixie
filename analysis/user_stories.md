@@ -59,15 +59,15 @@ This document contains comprehensive user stories for the Brixie mobile app - an
 
 #### [FOUNDATION-001] API Key Configuration
 
-**As a** user,  
-**I want** to enter an API key once during initial setup,  
-**So that** I can access Rebrickable data without repeated authentication.
+**As a** developer of Brixie,  
+**I want** to provide the App securly with an API key once during compilation,  
+**So that** Users can access Rebrickable API.
 
 **Acceptance Criteria:**
-- [ ] App provides clear instructions for obtaining an API key
-- [ ] User can enter and save API key
-- [ ] API key is securely stored in the iOS keychain
-- [ ] App validates the API key before saving
+- [ ] Compilation provides an option to enter the API Key from an build environment variable
+- [ ] The Build process fails when no API Key is injected
+- [ ] API key is securely compiled in the App
+- [ ] The build process injects it into the app
 - [ ] API key is used for all subsequent API calls
 
 **API Requirements:**
@@ -75,9 +75,7 @@ This document contains comprehensive user stories for the Brixie mobile app - an
 - Authentication: API key in header
 
 **Technical Considerations:**
-- Secure storage using iOS Keychain
-- Error handling for invalid keys
-- Support for updating/replacing keys
+- Error handling for missing keys
 
 **Story Points:** 3
 **Priority:** Must Have
