@@ -10,38 +10,30 @@
 #
 # Idempotency:
 #   - Re-running the script will NOT duplicate labels, milestones, or issues.
-#   - Existing issues are updated (title/body/labels/milestone) if found by ID in title.
+#   - Milestones created only if missing (or re-opened if closed).
+#   - Issues matched by token "[EPIC-###]" in the title; existing issues updated.
 #
 # Requirements:
-#   - bash 3.x compatible (no associative arrays)
-#   - gh (GitHub CLI) authenticated (GH_TOKEN / gh auth login)
-#   - jq (lightweight JSON parsing)
+#   - bash 3.x compatible
+#   - gh (GitHub CLI) authenticated
+#   - jq, sed, grep, tr
 #
 # Usage:
-#   ./scripts/bootstrap_brixie_user_stories.sh [-f analysis/user_stories.md] [-r owner/repo] [-c COMMIT_SHA]
+#   ./scripts/bootstrap_brixie_user_stories.sh \
+#       [-f analysis/user_stories.md] \
+#       [-r owner/repo] \
+#       [--dry-run] \
+#       [-c COMMIT_SHA]
 #
-# Notes:
-#   - The parser is intentionally pragmatic: it detects story blocks starting with lines like: "#### [FOUNDATION-001]"
-#   - Release sections (## Release vX.Y ...) define the milestone for subsequent stories until the next release heading.
-#   - Apple Platform Specific Features (after v1.0 list) are mapped heuristically:
-#       IOS-005, IOS-006, IOS-008 -> v1.1
-#       IOS-007 -> v1.2
-#     Adjust mapping logic below if desired.
+# Options:
+#   --dry-run  Show actions without performing writes.
 #
-# Exit codes:
-#   0 success
-#   1 usage / missing dependencies / fatal error
-#
-
 set -euo pipefail
 
-###############################################################################
-# Configuration defaults
-###############################################################################
 FILE="analysis/user_stories.md"
 REPO=""
 COMMIT_SHA=""
-DRY_RUN="${DRY_RUN:-false}"
+DRY_RUN="false"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -50,7 +42,7 @@ while [ $# -gt 0 ]; do
     -c|--commit) COMMIT_SHA="$2"; shift 2 ;;
     --dry-run) DRY_RUN="true"; shift ;;
     -h|--help)
-      grep '^#' "$0" | sed 's/^# \{0,1\}//'
+      grep '^# ' "$0" | sed 's/^# //'
       exit 0
       ;;
     *)
@@ -60,42 +52,34 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-###############################################################################
-# Dependency checks
-###############################################################################
 need() {
   if ! command -v "$1" >/dev/null 2>&1; then
-    echo "ERROR: '$1' is required." >&2
+    echo "ERROR: Required command not found: $1" >&2
     exit 1
   fi
 }
-
 need gh
 need jq
 need sed
 need grep
 need tr
 
-###############################################################################
-# Repository detection
-###############################################################################
+# Determine repo if not provided
 if [ -z "$REPO" ]; then
   if git remote -v 2>/dev/null | grep -q 'github.com'; then
-    # Extract owner/repo from first github remote
     REPO=$(git remote -v | grep -m1 'github.com' | sed -E 's#.*github.com[:/ ]([^ ]+)(\.git)? .*#\1#')
   fi
 fi
+# Strip trailing .git if somehow still present
+REPO=$(echo "$REPO" | sed -E 's/\.git$//')
 
 if [ -z "$REPO" ]; then
-  echo "ERROR: Unable to determine repository. Use -r owner/repo." >&2
+  echo "ERROR: Could not determine repository (use -r owner/repo)" >&2
   exit 1
 fi
 
 echo "Target repository: $REPO"
-
-###############################################################################
-# Helper functions
-###############################################################################
+[ "$DRY_RUN" = "true" ] && echo "Running in DRY RUN mode: no write operations will be performed."
 
 run() {
   if [ "$DRY_RUN" = "true" ]; then
@@ -105,113 +89,90 @@ run() {
   fi
 }
 
+# Milestone handling via gh api (since no native create subcommand exists)
+# ensure_milestone <title> <description>
 ensure_milestone() {
   local title="$1"
   local desc="$2"
-  if gh issue milestone view "$title" --repo "$REPO" >/dev/null 2>&1; then
-    echo "Milestone exists: $title"
+  # Fetch all milestones (open & closed) and try to match exactly
+  local existing
+  existing=$(gh api -X GET "repos/$REPO/milestones?state=all&per_page=100" \
+             --jq ".[] | select(.title==\"$title\") | @base64" 2>/dev/null || true)
+
+  if [ -n "$existing" ]; then
+    # Decode and check state
+    local decoded state number
+    decoded=$(echo "$existing" | head -n1 | base64 --decode)
+    state=$(echo "$decoded" | jq -r '.state')
+    number=$(echo "$decoded" | jq -r '.number')
+    if [ "$state" = "closed" ]; then
+      echo "Re-opening closed milestone: $title (#$number)"
+      run gh api -X PATCH "repos/$REPO/milestones/$number" -f state=open >/dev/null
+    else
+      echo "Milestone exists: $title"
+    fi
   else
     echo "Creating milestone: $title"
-    run gh issue milestone create --repo "$REPO" --title "$title" --description "$desc"
+    run gh api -X POST "repos/$REPO/milestones" -f title="$title" -f description="$desc" >/dev/null
   fi
 }
 
-# ensure_label NAME COLOR DESCRIPTION
+# Labels
 ensure_label() {
-  local name="$1"
-  local color="$2"
-  local desc="$3"
+  local name="$1" color="$2" desc="$3"
   if gh label view "$name" --repo "$REPO" >/dev/null 2>&1; then
-    # Optional: update color/description to enforce canonical values
+    # Keep labels up to date (color/desc)
     run gh label edit "$name" --repo "$REPO" --color "$color" --description "$desc"
-    echo "Label updated/existing: $name"
+    echo "Label ok: $name"
   else
     echo "Creating label: $name"
     run gh label create "$name" --repo "$REPO" --color "$color" --description "$desc"
   fi
 }
 
-# find_issue_by_id ID  -> prints issue number or empty
 find_issue_by_id() {
   local id="$1"
-  # Search by exact token in title
   local json
-  json=$(gh issue list --repo "$REPO" --search "$id in:title" --state all --limit 200 --json number,title 2>/dev/null || echo "[]")
+  # Use search with brackets in query
+  json=$(gh issue list --repo "$REPO" --search "\"$id\" in:title" --state all --limit 300 --json number,title 2>/dev/null || echo "[]")
   echo "$json" | jq -r --arg ID "$id" '.[] | select(.title | contains($ID)) | .number' | head -n1
 }
 
-# create_or_update_issue ID TITLE MILESTONE LABELS BODY_FILE
 create_or_update_issue() {
-  local id="$1"
-  local title="$2"
-  local milestone="$3"
-  local labels="$4"
-  local body_file="$5"
+  local id_token="$1" title="$2" milestone="$3" labels="$4" body_file="$5"
 
   local issue_number
-  issue_number=$(find_issue_by_id "$id" || true)
+  issue_number=$(find_issue_by_id "$id_token" || true)
 
   if [ -n "$issue_number" ]; then
-    echo "Updating issue #$issue_number ($id)"
-    # Add missing labels (gh issue edit with --add-label)
-    run gh issue edit "$issue_number" --repo "$REPO" --title "$title" --milestone "$milestone" --add-label "$labels" --body-file "$body_file"
+    echo "Updating issue #$issue_number ($id_token)"
+    run gh issue edit "$issue_number" --repo "$REPO" \
+        --title "$title" \
+        --milestone "$milestone" \
+        --add-label "$labels" \
+        --body-file "$body_file"
   else
     echo "Creating issue: $title"
-    run gh issue create --repo "$REPO" --title "$title" --milestone "$milestone" --label "$labels" --body-file "$body_file"
+    run gh issue create --repo "$REPO" \
+        --title "$title" \
+        --milestone "$milestone" \
+        --label "$labels" \
+        --body-file "$body_file"
   fi
 }
 
-sanitize_priority_label() {
-  echo "$1" | tr 'A-Z ' 'a-z-' | sed -E 's/-+$//'
+# Priority normalization to labels
+priority_to_label() {
+  local p=$(echo "$1" | tr 'A-Z' 'a-z')
+  case "$p" in
+    must*) echo "priority:must-have" ;;
+    should*) echo "priority:should-have" ;;
+    could*) echo "priority:could-have" ;;
+    *) echo "priority:should-have" ;;
+  esac
 }
 
-###############################################################################
-# Define milestones
-###############################################################################
-ensure_milestone "v1.0" "MVP release scope."
-ensure_milestone "v1.1" "Planned post-MVP enhancements."
-ensure_milestone "v1.2" "Further roadmap features."
-
-###############################################################################
-# Define labels (colors chosen for contrast)
-###############################################################################
-# Epic labels
-ensure_label "FOUNDATION" "1f77b4" "Foundation & API Integration"
-ensure_label "CONTENT"    "ff7f0e" "Content Discovery"
-ensure_label "COLLECTION" "2ca02c" "Collection Management"
-ensure_label "BUILD"      "d62728" "Build Intelligence"
-ensure_label "IOS"        "9467bd" "iOS / Apple Platform"
-ensure_label "PREMIUM"    "8c564b" "Premium Features"
-
-# Classification
-ensure_label "user-story"        "111111" "User story item"
-ensure_label "priority:must-have"   "b60205" "Highest priority"
-ensure_label "priority:should-have" "ffdd57" "Important"
-ensure_label "priority:could-have"  "c5def5" "Nice to have"
-
-# Story points
-ensure_label "sp:3" "0e8a16" "Story points 3"
-ensure_label "sp:5" "5319e7" "Story points 5"
-ensure_label "sp:8" "fbca04" "Story points 8"
-
-###############################################################################
-# Parse user stories file
-###############################################################################
-if [ ! -f "$FILE" ]; then
-  echo "ERROR: File not found: $FILE" >&2
-  exit 1
-fi
-
-echo "Parsing user stories from: $FILE"
-
-current_milestone=""
-current_id=""
-current_title=""
-current_block=""
-stories_tmp=$(mktemp)
-trap 'rm -f "$stories_tmp" ' EXIT
-
-# Heuristic milestone mapping for Apple platform features if outside release sections
+# Map unscoped Apple platform feature stories to milestones
 map_future_story_milestone() {
   case "$1" in
     IOS-005|IOS-006|IOS-008) echo "v1.1" ;;
@@ -220,41 +181,69 @@ map_future_story_milestone() {
   esac
 }
 
+ensure_milestone "v1.0" "MVP release scope."
+ensure_milestone "v1.1" "Post-MVP enhancements."
+ensure_milestone "v1.2" "Further roadmap features."
+
+# Epic labels
+ensure_label "FOUNDATION" "1f77b4" "Foundation & API Integration"
+ensure_label "CONTENT"    "ff7f0e" "Content Discovery"
+ensure_label "COLLECTION" "2ca02c" "Collection Management"
+ensure_label "BUILD"      "d62728" "Build Intelligence"
+ensure_label "IOS"        "9467bd" "iOS / Apple Platform"
+ensure_label "PREMIUM"    "8c564b" "Premium Features"
+
+# Classification & meta labels
+ensure_label "user-story"           "111111" "User story item"
+ensure_label "priority:must-have"   "b60205" "Highest priority"
+ensure_label "priority:should-have" "ffdd57" "Important"
+ensure_label "priority:could-have"  "c5def5" "Nice to have"
+
+# Story points labels
+ensure_label "sp:3" "0e8a16" "Story points 3"
+ensure_label "sp:5" "5319e7" "Story points 5"
+ensure_label "sp:8" "fbca04" "Story points 8"
+
+[ -f "$FILE" ] || { echo "ERROR: File not found: $FILE" >&2; exit 1; }
+
+echo "Parsing user stories from: $FILE"
+
+stories_tmp=$(mktemp)
+trap 'rm -f "$stories_tmp"' EXIT
+
+current_milestone=""
+current_id=""
+current_title=""
+current_block=""
+
 flush_story() {
   if [ -z "$current_id" ]; then
     return
   fi
-  # Extract priority
+
+  local priority story_points epic milestone
   priority=$(echo "$current_block" | grep -E '\*\*Priority:\*\*' | sed -E 's/.*\*\*Priority:\*\* *//; s/\r//' || true)
   story_points=$(echo "$current_block" | grep -E '\*\*Story Points:\*\*' | sed -E 's/.*\*\*Story Points:\*\* *//; s/\r//' || true)
-
   epic=$(echo "$current_id" | cut -d'-' -f1)
 
-  # If no milestone yet (e.g. after Apple Features section), map
-  local milestone="$current_milestone"
+  milestone="$current_milestone"
   if [ -z "$milestone" ]; then
     milestone=$(map_future_story_milestone "$current_id")
   fi
 
-  # Normalize
-  pr_label_raw=$(echo "$priority" | tr 'A-Z' 'a-z')
-  case "$pr_label_raw" in
-    must*)  pr_label="priority:must-have" ;;
-    should*) pr_label="priority:should-have" ;;
-    could*) pr_label="priority:could-have" ;;
-    *) pr_label="priority:should-have" ;;
-  esac
-
+  local pr_label sp_label
+  pr_label=$(priority_to_label "$priority")
   sp_label="sp:$story_points"
-  case "$story_points" in
-    3|5|8) : ;;
-    *) sp_label="sp:$story_points" ;;
-  esac
 
-  # Store fields: ID|Title|Epic|PriorityLabel|SPLabel|Milestone|RawBlock
-  printf '%s|%s|%s|%s|%s|%s|%s\n' "$current_id" "$current_title" "$epic" "$pr_label" "$sp_label" "$milestone" "$(printf %s "$current_block" | sed ':a;N;$!ba;s/\n/\\n/g')" >> "$stories_tmp"
+  printf '%s|%s|%s|%s|%s|%s|%s\n' \
+    "$current_id" \
+    "$current_title" \
+    "$epic" \
+    "$pr_label" \
+    "$sp_label" \
+    "$milestone" \
+    "$(printf %s "$current_block" | sed ':a;N;$!ba;s/\n/\\n/g')" >> "$stories_tmp"
 
-  # Reset
   current_id=""
   current_title=""
   current_block=""
@@ -262,34 +251,24 @@ flush_story() {
 
 while IFS= read -r line || [ -n "$line" ]; do
   case "$line" in
-    "## Release v1.0"* ) flush_story; current_milestone="v1.0" ;;
-    "## Release v1.1"* ) flush_story; current_milestone="v1.1" ;;
-    "## Release v1.2"* ) flush_story; current_milestone="v1.2" ;;
+    "## Release v1.0"*) flush_story; current_milestone="v1.0" ;;
+    "## Release v1.1"*) flush_story; current_milestone="v1.1" ;;
+    "## Release v1.2"*) flush_story; current_milestone="v1.2" ;;
     "#### ["*)
-        # New story
-        flush_story
-        # Parse ID and title
-        # Format: #### [FOUNDATION-001] API Key Configuration
-        id_part=$(echo "$line" | sed -E 's/#### \[([^]]+)\].*/\1/')
-        title_part=$(echo "$line" | sed -E 's/#### \[[^]]+\] *//')
-        current_id="$id_part"
-        current_title="$title_part"
-        current_block="$line"$'\n'
-        ;;
+      flush_story
+      current_id=$(echo "$line" | sed -E 's/#### \[([^]]+)\].*/\1/')
+      current_title=$(echo "$line" | sed -E 's/#### \[[^]]+\] *//')
+      current_block="$line"$'\n'
+      ;;
     *)
-        if [ -n "$current_id" ]; then
-          current_block+="$line"$'\n'
-        fi
-        ;;
+      if [ -n "$current_id" ]; then
+        current_block+="$line"$'\n'
+      fi
+      ;;
   esac
 done < "$FILE"
-
-# Flush last story
 flush_story
 
-###############################################################################
-# Create/update issues
-###############################################################################
 total=$(wc -l < "$stories_tmp" | tr -d ' ')
 echo "Discovered $total user stories."
 
@@ -298,12 +277,10 @@ while IFS='|' read -r sid stitle sepic spriority ssp smilestone sraw; do
   idx=$((idx+1))
   echo "[$idx/$total] Processing $sid"
 
-  # Body construction
   tmp_body=$(mktemp)
   {
     echo "#### [$sid] $stitle"
     echo
-    # Recover raw block newlines
     printf "%s" "$sraw" | sed 's/\\n/\n/g'
     echo
     echo "## Metadata"
@@ -317,13 +294,10 @@ while IFS='|' read -r sid stitle sepic spriority ssp smilestone sraw; do
 
   labels="user-story,$sepic,$spriority,$ssp"
   issue_title="[$sid] $stitle"
-
   create_or_update_issue "[$sid]" "$issue_title" "$smilestone" "$labels" "$tmp_body"
 
   rm -f "$tmp_body"
 done < "$stories_tmp"
 
 echo "Done. All user stories processed."
-if [ "$DRY_RUN" = "true" ]; then
-  echo "NOTE: DRY RUN mode - no changes were applied."
-fi
+[ "$DRY_RUN" = "true" ] && echo "Note: DRY RUN (no changes applied)."
