@@ -9,7 +9,6 @@ import Testing
 @testable import Brixie
 
 struct APIConfigurationTests {
-    
     @Test func apiKeyIsConfigured() async throws {
         // Test that API key is available and not empty
         #expect(!APIConfiguration.rebrickableAPIKey.isEmpty)
