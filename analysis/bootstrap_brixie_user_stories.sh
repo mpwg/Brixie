@@ -6,9 +6,54 @@
 
 set -e
 
+# Debug mode: set BRIXIE_DEBUG=1 or pass -d as first arg to enable verbose output
+BRIXIE_DEBUG=${BRIXIE_DEBUG:-0}
+if [[ "$1" == "-d" || "$1" == "--debug" ]]; then
+    BRIXIE_DEBUG=1
+    shift
+fi
+
+if [[ "$BRIXIE_DEBUG" == "1" || "$BRIXIE_DEBUG" == "true" ]]; then
+    echo "[DEBUG] Debug mode enabled"
+    # Print executed commands
+    set -x
+fi
+
+# Helper: parse JSON fields using jq if available, else python
+parse_json_field() {
+    local json="$1"
+    local field="$2"
+    if command -v jq &> /dev/null; then
+        echo "$json" | jq -r "$field" 2>/dev/null || true
+    else
+        # Python fallback: use json module to extract field path like .number or .html_url
+        python3 - <<PYCODE
+import sys, json
+try:
+    data=json.loads(sys.stdin.read())
+    # very small evaluator for simple dot paths
+    path="$field"
+    if path.startswith('.'):
+        parts=path[1:].split('.') if path!="." else []
+    else:
+        parts=path.split('.')
+    v=data
+    for p in parts:
+        if p=='' : continue
+        v=v.get(p)
+        if v is None:
+            print('')
+            sys.exit(0)
+    print(v)
+except Exception:
+    print('')
+PYCODE
+    fi
+}
+
 # Configuration
 REPO_OWNER="mpwg"
-REPO_NAME="Brixie-Apple"
+REPO_NAME="Brixie"
 GITHUB_API_URL="https://api.github.com"
 
 # Check if GitHub CLI is installed and authenticated
@@ -32,15 +77,33 @@ create_label() {
     
     if gh api "repos/$REPO_OWNER/$REPO_NAME/labels/$name" &> /dev/null; then
         echo "Label '$name' already exists, updating..."
-        gh api -X PATCH "repos/$REPO_OWNER/$REPO_NAME/labels/$name" \
+        if [[ "$BRIXIE_DEBUG" == "1" || "$BRIXIE_DEBUG" == "true" ]]; then
+            echo "[DEBUG] PATCH labels/$name payload: color=$color, description=$description"
+        fi
+        resp=$(gh api -X PATCH "repos/$REPO_OWNER/$REPO_NAME/labels/$name" \
             -f color="$color" \
-            -f description="$description" &> /dev/null
+            -f description="$description" 2>/dev/null || true)
+        url=$(parse_json_field "$resp" '.url')
+        if [[ -n "$url" ]]; then
+            echo "Updated label: $name -> $url"
+        else
+            echo "Updated label: $name"
+        fi
     else
         echo "Creating label '$name'..."
-        gh api -X POST "repos/$REPO_OWNER/$REPO_NAME/labels" \
+        if [[ "$BRIXIE_DEBUG" == "1" || "$BRIXIE_DEBUG" == "true" ]]; then
+            echo "[DEBUG] POST labels payload: name=$name, color=$color, description=$description"
+        fi
+        resp=$(gh api -X POST "repos/$REPO_OWNER/$REPO_NAME/labels" \
             -f name="$name" \
             -f color="$color" \
-            -f description="$description" &> /dev/null
+            -f description="$description" 2>/dev/null || true)
+        url=$(parse_json_field "$resp" '.url')
+        if [[ -n "$url" ]]; then
+            echo "Created label: $name -> $url"
+        else
+            echo "Created label: $name"
+        fi
     fi
 }
 
@@ -53,19 +116,31 @@ create_milestone() {
     # Check if milestone exists
     local existing_milestone=$(gh api "repos/$REPO_OWNER/$REPO_NAME/milestones" --jq ".[] | select(.title == \"$title\") | .number" 2>/dev/null || echo "")
     
-    if [[ -n "$existing_milestone" ]]; then
+        if [[ -n "$existing_milestone" ]]; then
         echo "Milestone '$title' already exists (number: $existing_milestone)"
     else
         echo "Creating milestone '$title'..."
         if [[ -n "$due_date" ]]; then
-            gh api -X POST "repos/$REPO_OWNER/$REPO_NAME/milestones" \
+            if [[ "$BRIXIE_DEBUG" == "1" || "$BRIXIE_DEBUG" == "true" ]]; then
+                echo "[DEBUG] POST milestones payload: title=$title, description=$description, due_on=$due_date"
+            fi
+            resp=$(gh api -X POST "repos/$REPO_OWNER/$REPO_NAME/milestones" \
                 -f title="$title" \
                 -f description="$description" \
-                -f due_on="$due_date" &> /dev/null
+                -f due_on="$due_date" 2>/dev/null || true)
         else
-            gh api -X POST "repos/$REPO_OWNER/$REPO_NAME/milestones" \
+            if [[ "$BRIXIE_DEBUG" == "1" || "$BRIXIE_DEBUG" == "true" ]]; then
+                echo "[DEBUG] POST milestones payload: title=$title, description=$description"
+            fi
+            resp=$(gh api -X POST "repos/$REPO_OWNER/$REPO_NAME/milestones" \
                 -f title="$title" \
-                -f description="$description" &> /dev/null
+                -f description="$description" 2>/dev/null || true)
+        fi
+        mnum=$(parse_json_field "$resp" '.number')
+        if [[ -n "$mnum" ]]; then
+            echo "Created milestone: $title (number: $mnum)"
+        else
+            echo "Created milestone: $title"
         fi
     fi
 }
@@ -85,30 +160,62 @@ create_issue() {
         echo "Issue '$title' already exists (number: $existing_issue)"
         return
     fi
-    
+
     echo "Creating issue '$title'..."
-    
+
     # Build the API call
-    local api_data="{\"title\": \"$title\", \"body\": \"$body\""
-    
+    local api_data
+    # Use a heredoc-friendly JSON construction to preserve newlines in body
     if [[ -n "$labels" ]]; then
-        api_data="$api_data, \"labels\": [$labels]"
+        labels_json="$labels"
+    else
+        labels_json=""
     fi
-    
+
+    # Resolve milestone number if provided
+    local milestone_number=""
     if [[ -n "$milestone" ]]; then
-        local milestone_number=$(gh api "repos/$REPO_OWNER/$REPO_NAME/milestones" --jq ".[] | select(.title == \"$milestone\") | .number" 2>/dev/null || echo "")
-        if [[ -n "$milestone_number" ]]; then
-            api_data="$api_data, \"milestone\": $milestone_number"
-        fi
+        milestone_number=$(gh api "repos/$REPO_OWNER/$REPO_NAME/milestones" --jq ".[] | select(.title == \"$milestone\") | .number" 2>/dev/null || true)
     fi
-    
+
+    # Build JSON using python to escape properly
+    body_json=$(echo "$body" | python3 -c 'import sys, json; print(json.dumps(sys.stdin.read()))') || body_json='""'
+    api_data="{\"title\": \"$title\", \"body\": $body_json"
+
+    if [[ -n "$labels_json" ]]; then
+        api_data="$api_data, \"labels\": [$labels_json]"
+    fi
+
+    if [[ -n "$milestone_number" ]]; then
+        api_data="$api_data, \"milestone\": $milestone_number"
+    fi
+
     if [[ -n "$assignees" ]]; then
         api_data="$api_data, \"assignees\": [$assignees]"
     fi
-    
+
     api_data="$api_data}"
-    
-    gh api -X POST "repos/$REPO_OWNER/$REPO_NAME/issues" --input - <<< "$api_data" &> /dev/null
+
+    if [[ "$BRIXIE_DEBUG" == "1" || "$BRIXIE_DEBUG" == "true" ]]; then
+        echo "[DEBUG] Issue payload for '$title':"
+        echo "$api_data"
+    fi
+
+    # Send request and capture response; parse concise output
+    resp=$(gh api -X POST "repos/$REPO_OWNER/$REPO_NAME/issues" --input - <<< "$api_data" 2>/dev/null || true)
+    inumber=$(parse_json_field "$resp" '.number')
+    iurl=$(parse_json_field "$resp" '.html_url')
+    if [[ -n "$inumber" ]]; then
+        echo "Created issue #$inumber: $iurl"
+    else
+        # Try to extract message from error payload if present
+        msg=$(echo "$resp" | jq -r '.message // empty' 2>/dev/null || true)
+        if [[ -n "$msg" ]]; then
+            echo "Failed to create issue: $msg"
+        else
+            echo "Failed to create issue: unknown error"
+        fi
+    fi
 }
 
 echo "Creating labels..."
