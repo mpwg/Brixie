@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop]
   pull_request:
-    branches: [ main, develop ]
+    branches: [main, develop]
   workflow_dispatch:
 
 env:
@@ -13,119 +13,119 @@ env:
 jobs:
   lint:
     name: SwiftLint
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: SwiftLint
-      uses: norio-nomura/action-swiftlint@3.2.1
-      with:
-        args: --strict
+      - uses: actions/checkout@v4
+
+      - name: SwiftLint
+        uses: norio-nomura/action-swiftlint@3.2.1
+        with:
+          args: --strict
 
   build-and-test:
     name: Build and Test
     runs-on: macos-latest
     strategy:
       matrix:
-        destination: 
+        destination:
           - "platform=iOS Simulator,OS=latest,name=iPhone 15 Pro"
           - "platform=iOS Simulator,OS=latest,name=iPhone 15"
           - "platform=iOS Simulator,OS=latest,name=iPad Pro (12.9-inch) (6th generation)"
-        
+
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Select Xcode
-      run: sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
-    
-    - name: Set up environment variables
-      env:
-        REBRICKABLE_API_KEY: ${{ secrets.REBRICKABLE_API_KEY }}
-      run: |
-        if [ -z "$REBRICKABLE_API_KEY" ]; then
-          echo "Warning: REBRICKABLE_API_KEY not set, using placeholder for CI"
-          export REBRICKABLE_API_KEY="ci_placeholder_key_not_for_production"
-        fi
-        echo "REBRICKABLE_API_KEY=$REBRICKABLE_API_KEY" >> $GITHUB_ENV
-    
-    - name: Inject API Key
-      run: |
-        chmod +x Scripts/inject-api-key.sh
-        ./Scripts/inject-api-key.sh
-    
-    - name: Build
-      run: |
-        cd Brixie
-        xcodebuild -project Brixie.xcodeproj \
-          -scheme Brixie \
-          -destination '${{ matrix.destination }}' \
-          -configuration Debug \
-          ONLY_ACTIVE_ARCH=NO \
-          CODE_SIGNING_REQUIRED=NO \
-          build
-    
-    - name: Test
-      run: |
-        cd Brixie
-        xcodebuild -project Brixie.xcodeproj \
-          -scheme Brixie \
-          -destination '${{ matrix.destination }}' \
-          -configuration Debug \
-          ONLY_ACTIVE_ARCH=NO \
-          CODE_SIGNING_REQUIRED=NO \
-          test
-    
-    - name: Upload test results
-      uses: actions/upload-artifact@v4
-      if: failure()
-      with:
-        name: test-results-${{ matrix.destination }}
-        path: |
-          /tmp/*.xcresult
-        retention-days: 7
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+
+      - name: Set up environment variables
+        env:
+          REBRICKABLE_API_KEY: ${{ secrets.REBRICKABLE_API_KEY }}
+        run: |
+          if [ -z "$REBRICKABLE_API_KEY" ]; then
+            echo "Warning: REBRICKABLE_API_KEY not set, using placeholder for CI"
+            export REBRICKABLE_API_KEY="ci_placeholder_key_not_for_production"
+          fi
+          echo "REBRICKABLE_API_KEY=$REBRICKABLE_API_KEY" >> $GITHUB_ENV
+
+      - name: Inject API Key
+        run: |
+          chmod +x Scripts/inject-api-key.sh
+          ./Scripts/inject-api-key.sh
+
+      - name: Build
+        run: |
+          cd Brixie
+          xcodebuild -project Brixie.xcodeproj \
+            -scheme Brixie \
+            -destination '${{ matrix.destination }}' \
+            -configuration Debug \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Test
+        run: |
+          cd Brixie
+          xcodebuild -project Brixie.xcodeproj \
+            -scheme Brixie \
+            -destination '${{ matrix.destination }}' \
+            -configuration Debug \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            test
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-results-${{ matrix.destination }}
+          path: |
+            /tmp/*.xcresult
+          retention-days: 7
 
   build-release:
     name: Build Release
     runs-on: macos-latest
     needs: [lint, build-and-test]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    
+
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Select Xcode
-      run: sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
-    
-    - name: Set up environment variables
-      env:
-        REBRICKABLE_API_KEY: ${{ secrets.REBRICKABLE_API_KEY }}
-      run: |
-        if [ -z "$REBRICKABLE_API_KEY" ]; then
-          echo "Error: REBRICKABLE_API_KEY secret is required for release builds"
-          exit 1
-        fi
-        echo "REBRICKABLE_API_KEY=$REBRICKABLE_API_KEY" >> $GITHUB_ENV
-    
-    - name: Inject API Key
-      run: |
-        chmod +x Scripts/inject-api-key.sh
-        ./Scripts/inject-api-key.sh
-    
-    - name: Build Release
-      run: |
-        cd Brixie
-        xcodebuild -project Brixie.xcodeproj \
-          -scheme Brixie \
-          -destination 'generic/platform=iOS' \
-          -configuration Release \
-          ONLY_ACTIVE_ARCH=NO \
-          CODE_SIGNING_REQUIRED=NO \
-          build
-    
-    - name: Archive build artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: release-build
-        path: |
-          Brixie/build/
-        retention-days: 30
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+
+      - name: Set up environment variables
+        env:
+          REBRICKABLE_API_KEY: ${{ secrets.REBRICKABLE_API_KEY }}
+        run: |
+          if [ -z "$REBRICKABLE_API_KEY" ]; then
+            echo "Error: REBRICKABLE_API_KEY secret is required for release builds"
+            exit 1
+          fi
+          echo "REBRICKABLE_API_KEY=$REBRICKABLE_API_KEY" >> $GITHUB_ENV
+
+      - name: Inject API Key
+        run: |
+          chmod +x Scripts/inject-api-key.sh
+          ./Scripts/inject-api-key.sh
+
+      - name: Build Release
+        run: |
+          cd Brixie
+          xcodebuild -project Brixie.xcodeproj \
+            -scheme Brixie \
+            -destination 'generic/platform=iOS' \
+            -configuration Release \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Archive build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-build
+          path: |
+            Brixie/build/
+          retention-days: 30
