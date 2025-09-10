@@ -1,0 +1,189 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.0.0)'
+        required: true
+        type: string
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+
+jobs:
+  create-release:
+    name: Create Release Build
+    runs-on: macos-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Select Xcode
+      run: sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+    
+    - name: Get version
+      id: version
+      run: |
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+        else
+          echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Validate API Key Secret
+      env:
+        REBRICKABLE_API_KEY: ${{ secrets.REBRICKABLE_API_KEY }}
+      run: |
+        if [ -z "$REBRICKABLE_API_KEY" ]; then
+          echo "❌ Error: REBRICKABLE_API_KEY secret is required for release builds"
+          echo "Please configure the REBRICKABLE_API_KEY secret in repository settings"
+          exit 1
+        fi
+        echo "✅ API key secret is configured"
+        echo "REBRICKABLE_API_KEY=$REBRICKABLE_API_KEY" >> $GITHUB_ENV
+    
+    - name: Inject API Key
+      run: |
+        chmod +x Scripts/inject-api-key.sh
+        ./Scripts/inject-api-key.sh
+    
+    - name: Update version in project
+      run: |
+        VERSION="${{ steps.version.outputs.version }}"
+        VERSION_NUMBER="${VERSION#v}"
+        echo "Setting version to $VERSION_NUMBER"
+        
+        # Update Info.plist with new version
+        /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION_NUMBER" Brixie/Brixie/Info.plist
+        /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.run_number }}" Brixie/Brixie/Info.plist
+    
+    - name: Build Release for iOS
+      run: |
+        cd Brixie
+        xcodebuild -project Brixie.xcodeproj \
+          -scheme Brixie \
+          -destination 'generic/platform=iOS' \
+          -configuration Release \
+          -archivePath "build/Brixie.xcarchive" \
+          ONLY_ACTIVE_ARCH=NO \
+          CODE_SIGNING_REQUIRED=NO \
+          archive
+    
+    - name: Build Release for iOS Simulator
+      run: |
+        cd Brixie
+        xcodebuild -project Brixie.xcodeproj \
+          -scheme Brixie \
+          -destination 'generic/platform=iOS Simulator' \
+          -configuration Release \
+          -archivePath "build/Brixie-Simulator.xcarchive" \
+          ONLY_ACTIVE_ARCH=NO \
+          CODE_SIGNING_REQUIRED=NO \
+          archive
+    
+    - name: Generate Changelog
+      id: changelog
+      run: |
+        # Generate changelog from commits since last tag
+        LAST_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+        if [ -z "$LAST_TAG" ]; then
+          CHANGELOG="Initial release"
+        else
+          CHANGELOG=$(git log --pretty=format:"- %s" $LAST_TAG..HEAD | grep -v "^- Merge")
+        fi
+        
+        echo "changelog<<EOF" >> $GITHUB_OUTPUT
+        echo "$CHANGELOG" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+    
+    - name: Create Release Archive
+      run: |
+        mkdir -p release-artifacts
+        
+        # Archive the built app
+        if [ -d "Brixie/build/Brixie.xcarchive" ]; then
+          cd Brixie/build
+          zip -r ../../release-artifacts/Brixie-iOS-${{ steps.version.outputs.version }}.zip Brixie.xcarchive
+          cd ../..
+        fi
+        
+        if [ -d "Brixie/build/Brixie-Simulator.xcarchive" ]; then
+          cd Brixie/build
+          zip -r ../../release-artifacts/Brixie-Simulator-${{ steps.version.outputs.version }}.zip Brixie-Simulator.xcarchive
+          cd ../..
+        fi
+        
+        # Create source archive
+        git archive --format=zip --prefix=Brixie-${{ steps.version.outputs.version }}/ HEAD > release-artifacts/Brixie-Source-${{ steps.version.outputs.version }}.zip
+    
+    - name: Create GitHub Release
+      uses: actions/create-release@v1
+      id: create_release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.version.outputs.version }}
+        release_name: Brixie ${{ steps.version.outputs.version }}
+        body: |
+          ## What's Changed
+          
+          ${{ steps.changelog.outputs.changelog }}
+          
+          ## Installation
+          
+          This release includes:
+          - iOS Device Archive (`Brixie-iOS-${{ steps.version.outputs.version }}.zip`)
+          - iOS Simulator Archive (`Brixie-Simulator-${{ steps.version.outputs.version }}.zip`)
+          - Source Code (`Brixie-Source-${{ steps.version.outputs.version }}.zip`)
+          
+          ## Setup
+          
+          To build from source:
+          1. Set `REBRICKABLE_API_KEY` environment variable
+          2. Open `Brixie.xcodeproj` in Xcode
+          3. Build and run
+          
+          ## API Key Required
+          
+          ⚠️ **Important**: You need a Rebrickable API key to run this app.
+          Get yours at [rebrickable.com](https://rebrickable.com/api/)
+        draft: false
+        prerelease: ${{ contains(steps.version.outputs.version, 'beta') || contains(steps.version.outputs.version, 'alpha') }}
+    
+    - name: Upload iOS Archive
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./release-artifacts/Brixie-iOS-${{ steps.version.outputs.version }}.zip
+        asset_name: Brixie-iOS-${{ steps.version.outputs.version }}.zip
+        asset_content_type: application/zip
+      if: hashFiles('release-artifacts/Brixie-iOS-*.zip') != ''
+    
+    - name: Upload Simulator Archive
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./release-artifacts/Brixie-Simulator-${{ steps.version.outputs.version }}.zip
+        asset_name: Brixie-Simulator-${{ steps.version.outputs.version }}.zip
+        asset_content_type: application/zip
+      if: hashFiles('release-artifacts/Brixie-Simulator-*.zip') != ''
+    
+    - name: Upload Source Archive
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./release-artifacts/Brixie-Source-${{ steps.version.outputs.version }}.zip
+        asset_name: Brixie-Source-${{ steps.version.outputs.version }}.zip
+        asset_content_type: application/zip

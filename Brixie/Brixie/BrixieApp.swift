@@ -22,6 +22,11 @@ struct BrixieApp: App {
             fatalError("Could not create ModelContainer: \(error)")
         }
     }()
+    
+    init() {
+        // Validate API configuration on app startup
+        APIConfiguration.validateConfiguration()
+    }
 
     var body: some Scene {
         WindowGroup {

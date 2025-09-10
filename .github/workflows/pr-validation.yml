@@ -1,0 +1,132 @@
+name: PR Validation
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+  pull_request_target:
+    branches: [ main, develop ]
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+
+jobs:
+  security-check:
+    name: Security Validation
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Check for API key leaks
+      run: |
+        echo "Checking for accidental API key commits..."
+        if grep -r "REBRICKABLE_API_KEY_INJECTED.*=.*['\"][^'\"]" . --exclude-dir=.git --exclude-dir=.github; then
+          echo "❌ Error: Found hardcoded API key in code!"
+          echo "API keys should only be injected at build time."
+          exit 1
+        fi
+        echo "✅ No hardcoded API keys found"
+    
+    - name: Verify APIKeyInjected.swift is not committed
+      run: |
+        if [ -f "Brixie/Brixie/APIKeyInjected.swift" ]; then
+          echo "❌ Error: APIKeyInjected.swift should not be committed!"
+          echo "This file is generated during build time and contains sensitive data."
+          exit 1
+        fi
+        echo "✅ APIKeyInjected.swift properly excluded from version control"
+    
+    - name: Check .gitignore configuration
+      run: |
+        if ! grep -q "Brixie/APIKeyInjected.swift" .gitignore; then
+          echo "❌ Error: APIKeyInjected.swift not found in .gitignore"
+          exit 1
+        fi
+        echo "✅ .gitignore properly configured"
+
+  code-quality:
+    name: Code Quality
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Select Xcode
+      run: sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+    
+    - name: Set up test API key for analysis
+      run: |
+        export REBRICKABLE_API_KEY="analysis_placeholder_key"
+        echo "REBRICKABLE_API_KEY=$REBRICKABLE_API_KEY" >> $GITHUB_ENV
+    
+    - name: Inject API Key for analysis
+      run: |
+        chmod +x Scripts/inject-api-key.sh
+        ./Scripts/inject-api-key.sh
+    
+    - name: Swift Package Resolution
+      run: |
+        cd Brixie
+        xcodebuild -resolvePackageDependencies -project Brixie.xcodeproj
+    
+    - name: Build Analysis
+      run: |
+        cd Brixie
+        xcodebuild -project Brixie.xcodeproj \
+          -scheme Brixie \
+          -destination 'platform=iOS Simulator,OS=latest,name=iPhone 15 Pro' \
+          -configuration Debug \
+          ONLY_ACTIVE_ARCH=NO \
+          CODE_SIGNING_REQUIRED=NO \
+          clean build \
+          | xcpretty --report html --output build-report.html
+    
+    - name: Upload build report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: build-analysis-report
+        path: Brixie/build-report.html
+        retention-days: 7
+
+  compatibility-check:
+    name: iOS Version Compatibility
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        ios-version: ["17.0", "18.0"]
+        device: ["iPhone 15", "iPad Pro (12.9-inch) (6th generation)"]
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Select Xcode
+      run: sudo xcode-select -switch /Applications/Xcode.app/Contents/Developer
+    
+    - name: Set up test API key
+      run: |
+        export REBRICKABLE_API_KEY="compatibility_test_key"
+        echo "REBRICKABLE_API_KEY=$REBRICKABLE_API_KEY" >> $GITHUB_ENV
+    
+    - name: Inject API Key
+      run: |
+        chmod +x Scripts/inject-api-key.sh
+        ./Scripts/inject-api-key.sh
+    
+    - name: Test iOS ${{ matrix.ios-version }} compatibility
+      run: |
+        cd Brixie
+        xcodebuild -project Brixie.xcodeproj \
+          -scheme Brixie \
+          -destination 'platform=iOS Simulator,OS=${{ matrix.ios-version }},name=${{ matrix.device }}' \
+          -configuration Debug \
+          ONLY_ACTIVE_ARCH=NO \
+          CODE_SIGNING_REQUIRED=NO \
+          build-for-testing
+      continue-on-error: true
+    
+    - name: Report compatibility status
+      if: failure()
+      run: |
+        echo "❌ Compatibility issue detected with iOS ${{ matrix.ios-version }} on ${{ matrix.device }}"
+        echo "This may require investigation or iOS version requirement updates."
