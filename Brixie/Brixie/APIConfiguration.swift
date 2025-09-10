@@ -14,7 +14,7 @@ struct APIConfiguration {
         if let key = ProcessInfo.processInfo.environment["REBRICKABLE_API_KEY"], !key.isEmpty {
             return key
         } else {
-            fatalError("REBRICKABLE_API_KEY environment variable is required for debug builds")
+            fatalError("REBRICKABLE_API_KEY environment variable is required for debug builds. Set it with: export REBRICKABLE_API_KEY=\"your_key_here\"")
         }
         #else
         // In release builds, use the compile-time injected key
