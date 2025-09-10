@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(gh issue view:*)",
+      "Bash(chmod:*)",
+      "Bash(export:*)",
+      "Bash(./Scripts/inject-api-key.sh:*)",
+      "Bash(xcodebuild:*)",
+      "Bash(unset REBRICKABLE_API_KEY)",
+      "Bash(swift:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

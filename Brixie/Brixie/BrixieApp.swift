@@ -12,7 +12,7 @@ import SwiftData
 struct BrixieApp: App {
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
-            Item.self,
+            Item.self
         ])
         let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 
@@ -22,6 +22,11 @@ struct BrixieApp: App {
             fatalError("Could not create ModelContainer: \(error)")
         }
     }()
+    
+    init() {
+        // Validate API configuration on app startup
+        APIConfiguration.validateConfiguration()
+    }
 
     var body: some Scene {
         WindowGroup {
